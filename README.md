@@ -8,4 +8,4 @@ And adding ```"allowed_origins": [
     ]``` id of chrome-extension in here. This can be seen in extensions page when loading the package.
 
 
-python requires ``cryptography`` and ``pyopenssl` packages
+python requires ``cryptography`` and ``pyopenssl`` packages
