@@ -1,11 +1,11 @@
 import sys
 import json
-import os
 import ssl
 import socket
 from base64 import b64encode
 from datetime import datetime
 import hashlib
+from OpenSSL import SSL
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -32,15 +32,16 @@ def load_trusted_certificates(pem_file_path):
                     try:
                         cert = x509.load_pem_x509_certificate(cert_str.encode('utf-8'), default_backend())
                         certs.append(cert)
-                        log(f"Successfully loaded certificate: {cert.subject.rfc4514_string()}")
                     except Exception as e:
                         log(f"Error loading certificate: {e}")
+        log(f"Successfully loaded all certificates")
     except Exception as e:
         log(f"Error loading certificates from {pem_file_path}: {e}")
     return certs
 
+
 # Path to your single .pem file containing multiple certificates
-mozilla_ca_certs = load_trusted_certificates("path/to/your/certs_bundle.pem")
+mozilla_ca_certs = load_trusted_certificates("certificates/cacert.pem")
 
 def is_built_in_root(cert):
     try:
@@ -51,14 +52,23 @@ def is_built_in_root(cert):
         log(f"Error checking if certificate is built-in root: {e}")
     return False
 
+def serialize_bytes(obj):
+    if isinstance(obj, bytes):
+        return obj.hex()
+    raise TypeError("Type not serializable")
+
 def get_certificate_info(cert):
     try:
-        x509_cert = x509.load_der_x509_certificate(cert, default_backend())
-        raw_der = cert
-        sha1_fingerprint = hashlib.sha1(raw_der).hexdigest()
-        sha256_fingerprint = hashlib.sha256(raw_der).hexdigest()
+        # Convert OpenSSL certificate to cryptography certificate
+        cert_bytes = cert.to_cryptography().public_bytes(serialization.Encoding.DER)
+        x509_cert = x509.load_der_x509_certificate(cert_bytes, default_backend())
+        
+        sha1_fingerprint = cert.digest('sha1').decode('ascii')
+        sha256_fingerprint = cert.digest('sha256').decode('ascii')
         sha256_pub_key_info = hashlib.sha256(x509_cert.public_key().public_bytes(
-            encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo)).digest()
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )).hexdigest()
         
         return {
             "fingerprint": {
@@ -66,16 +76,24 @@ def get_certificate_info(cert):
                 "sha256": sha256_fingerprint,
             },
             "isBuiltInRoot": is_built_in_root(x509_cert),
-            "issuer": x509_cert.issuer.rfc4514_string(),
-            "rawDER": list(raw_der),
-            "serialNumber": str(x509_cert.serial_number),
-            "subject": x509_cert.subject.rfc4514_string(),
+            "issuer": [
+                (k.decode('utf-8') if isinstance(k, bytes) else k, 
+                 v.decode('utf-8') if isinstance(v, bytes) else v) 
+                for k, v in cert.get_issuer().get_components()
+            ],
+            "rawDER": cert_bytes.hex(),  # Convert bytes to hex string
+            "serialNumber": str(cert.get_serial_number()),
+            "subject": [
+                (k.decode('utf-8') if isinstance(k, bytes) else k, 
+                 v.decode('utf-8') if isinstance(v, bytes) else v) 
+                for k, v in cert.get_subject().get_components()
+            ],
             "subjectPublicKeyInfoDigest": {
-                "sha256": b64encode(sha256_pub_key_info).decode('ascii')
+                "sha256": sha256_pub_key_info
             },
             "validity": {
-                "start": x509_cert.not_valid_before.timestamp() * 1000,
-                "end": x509_cert.not_valid_after.timestamp() * 1000
+                "start": int(datetime.strptime(cert.get_notBefore().decode('ascii'), "%Y%m%d%H%M%SZ").timestamp() * 1000),
+                "end": int(datetime.strptime(cert.get_notAfter().decode('ascii'), "%Y%m%d%H%M%SZ").timestamp() * 1000)
             }
         }
     except Exception as e:
@@ -84,42 +102,27 @@ def get_certificate_info(cert):
 
 def get_security_info(domain):
     try:
-        context = ssl.create_default_context()
-        conn = context.wrap_socket(
-            socket.socket(socket.AF_INET),
-            server_hostname=domain,
-        )
-        conn.connect((domain, 443))
+        dst = (domain, 443)
+        ctx = SSL.Context(SSL.SSLv23_METHOD)
+        s = socket.create_connection(dst)
+        s = SSL.Connection(ctx, s)
+        s.set_connect_state()
+        s.set_tlsext_host_name(dst[0].encode())
 
-        # Retrieve the full certificate chain
-        der_cert_chain = conn.getpeercert(binary_form=True)
-        log(f"Retrieved DER certificate chain for {domain}: {der_cert_chain}")
+        s.sendall(b'HEAD / HTTP/1.0\r\n\r\n')
+        s.recv(16)
+
+        cert_chain = s.get_peer_cert_chain()
         
-        pem_cert_chain = ssl.DER_cert_to_PEM_cert(der_cert_chain)
-        log(f"Converted to PEM certificate chain for {domain}: {pem_cert_chain}")
+        certificates = [get_certificate_info(cert) for cert in cert_chain]
         
-        x509_chain = []
-        for cert_str in pem_cert_chain.split("-----END CERTIFICATE-----\n"):
-            if "-----BEGIN CERTIFICATE-----" in cert_str:
-                cert_str = cert_str + "-----END CERTIFICATE-----\n"  # Ensure the certificate is complete
-                try:
-                    x509_cert = x509.load_pem_x509_certificate(cert_str.encode('utf-8'), default_backend())
-                    x509_chain.append(x509_cert)
-                except Exception as e:
-                    log(f"Error loading X509 certificate for {domain}: {e}")
-        
-        certificates = [get_certificate_info(cert.public_bytes(encoding=serialization.Encoding.DER)) for cert in x509_chain]
+        s.close()
+
         log(f"Parsed certificates for {domain}: {certificates}")
-
-        security_info = {
-            "certificates": certificates
-        }
-
-        return security_info
+        return {"certificates": certificates}
     except Exception as e:
         log(f"Error retrieving security info for {domain}: {e}")
         return {"error": str(e)}
-
 def read_message():
     raw_length = sys.stdin.read(4)
     if not raw_length:
@@ -129,10 +132,10 @@ def read_message():
     return json.loads(message)
 
 def send_message(message_content):
-    message_json = json.dumps(message_content)
-    sys.stdout.write(len(message_json).to_bytes(4, byteorder='little').decode('utf-8'))
-    sys.stdout.write(message_json)
-    sys.stdout.flush()
+    message_json = json.dumps(message_content, default=serialize_bytes)
+    sys.stdout.buffer.write(len(message_json).to_bytes(4, byteorder='little'))
+    sys.stdout.buffer.write(message_json.encode('utf-8'))
+    sys.stdout.buffer.flush()
 
 log("Starting native messaging host")
 
